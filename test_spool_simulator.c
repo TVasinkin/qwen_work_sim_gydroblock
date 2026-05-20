@@ -1,504 +1,406 @@
 /**
  * @file test_spool_simulator.c
- * @brief Модульные тесты для симулятора золотника
- * 
- * Запуск тестов (на хост-машине):
- *   gcc -o test_spool test_spool_simulator.c spool_simulator.c -lm
- *   ./test_spool
+ * @brief Модульные тесты для симулятора золотника с двумя клапанами
  */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <math.h>
-#include <stdbool.h>
-#include <stdint.h>
+#include <assert.h>
 #include "spool_simulator.h"
 
-/* ============================================================================
- * МАКРОСЫ ДЛЯ ТЕСТИРОВАНИЯ
- * ============================================================================ */
+#define TEST_PASSED(name) printf("[PASS] %s\n", name)
+#define TEST_FAILED(name, msg) printf("[FAIL] %s: %s\n", name, msg)
 
-#define TEST_PASSED 0
-#define TEST_FAILED 1
-
-#define ASSERT(condition, message) \
-    do { \
-        if (!(condition)) { \
-            printf("  ❌ FAILED: %s\n", message); \
-            return TEST_FAILED; \
-        } \
-    } while(0)
-
-#define ASSERT_FLOAT(expected, actual, tolerance, message) \
-    do { \
-        float diff = fabsf((expected) - (actual)); \
-        if (diff > (tolerance)) { \
-            printf("  ❌ FAILED: %s\n", message); \
-            printf("     Expected: %f, Actual: %f, Diff: %f\n", \
-                   (float)(expected), (float)(actual), diff); \
-            return TEST_FAILED; \
-        } \
-    } while(0)
-
-#define PRINT_TEST_START(name) \
-    printf("\n▶ Test: %s\n", name)
-
-#define PRINT_TEST_PASS() \
-    printf("  ✅ PASSED\n")
+static int tests_run = 0;
+static int tests_passed = 0;
 
 /* ============================================================================
- * ТЕСТЫ
+ * ТЕСТ 1: Инициализация и сброс
  * ============================================================================ */
-
-/**
- * @brief Тест инициализации симулятора
- */
-int test_initialization(void) {
-    PRINT_TEST_START("Initialization");
-    
+void test_initialization(void) {
+    const char* name = "Initialization";
     SpoolSimulator_t sim;
-    SpoolConfig_t config = {
-        .dt_ms = 1.0f,
-        .valve_response_time_ms = 15.0f,
-        .hydraulic_delay_ms = 5.0f,
-        .damping_coefficient = 0.7f,
-        .mass_kg = 0.5f
-    };
+    SpoolConfig_t config = { .dt = 0.001f, .pressure_deviation = 2.0f, .seed = 42 };
     
-    // Тест инициализации
-    ASSERT(SpoolSimulator_Init(&sim, &config) == true, "Init should return true");
-    ASSERT(SpoolSimulator_IsInitialized(&sim) == true, "Should be initialized");
-    
-    // Проверка начального положения (центр)
-    uint16_t pos = SpoolSimulator_GetPosition(&sim);
-    ASSERT(pos == 6000, "Initial position should be center (6000)");
-    
-    // Проверка начальной скорости
-    ASSERT_FLOAT(0.0f, SpoolSimulator_GetVelocity(&sim), 0.01f, "Initial velocity should be 0");
-    
-    // Проверка начальных давлений
-    ASSERT_FLOAT(0.0f, SpoolSimulator_GetPressureLeft(&sim), 100.0f, "Initial left pressure should be 0");
-    ASSERT_FLOAT(0.0f, SpoolSimulator_GetPressureRight(&sim), 100.0f, "Initial right pressure should be 0");
-    
-    // Тест сброса
-    SpoolSimulator_Reset(&sim);
-    ASSERT(SpoolSimulator_IsInitialized(&sim) == true, "Should be initialized after reset");
-    
-    PRINT_TEST_PASS();
-    return TEST_PASSED;
-}
-
-/**
- * @brief Тест порога страгивания (20% ШИМ)
- */
-int test_stiction_threshold(void) {
-    PRINT_TEST_START("Stiction Threshold (20%)");
-    
-    SpoolSimulator_t sim;
-    SpoolConfig_t config = {0};
     SpoolSimulator_Init(&sim, &config);
     
-    // PWM ниже 20% - золотник не должен двигаться
-    SpoolSimulator_Update(&sim, 1399, 1.0f); // 19.99%
+    if (SpoolSimulator_GetPosition(&sim) != 0) {
+        TEST_FAILED(name, "Initial position should be 0");
+        return;
+    }
+    
+    SpoolSimulator_Step(&sim, 3500, 3500, 0.001f); // Движение
+    SpoolSimulator_Reset(&sim);
+    
+    if (SpoolSimulator_GetPosition(&sim) != 0) {
+        TEST_FAILED(name, "Position should be 0 after reset");
+        return;
+    }
+    
+    TEST_PASSED(name);
+    tests_passed++;
+}
+
+/* ============================================================================
+ * ТЕСТ 2: Мертвая зона (< 10% ШИМ)
+ * ============================================================================ */
+void test_dead_zone(void) {
+    const char* name = "Dead Zone (<10%)";
+    SpoolSimulator_t sim;
+    SpoolSimulator_Init(&sim, NULL);
+    
+    // Подаем 9% на оба клапана (630 отсчетов)
+    uint16_t pwm_below_threshold = 630; // 9% от 7000
+    
     for (int i = 0; i < 100; i++) {
-        SpoolSimulator_Update(&sim, 1399, 1.0f);
+        SpoolSimulator_Step(&sim, pwm_below_threshold, pwm_below_threshold, 0.001f);
     }
     
-    uint16_t pos = SpoolSimulator_GetPosition(&sim);
-    ASSERT(pos == 6000, "Position should not change below 20% threshold");
-    ASSERT(SpoolSimulator_IsMoving(&sim) == false, "Should not be moving below threshold");
-    
-    // PWM на 20% - начало движения
-    SpoolSimulator_Reset(&sim);
-    SpoolSimulator_Update(&sim, 1400, 1.0f); // Ровно 20%
-    
-    // Даем время на реакцию клапана
-    for (int i = 0; i < 50; i++) {
-        SpoolSimulator_Update(&sim, 1400, 1.0f);
+    // Золотник должен вернуться в 0 или остаться около 0
+    int32_t pos = SpoolSimulator_GetPosition(&sim);
+    if (abs(pos) > 500) {
+        TEST_FAILED(name, "Position should stay near 0 in dead zone");
+        return;
     }
     
-    // Золотник должен начать движение
-    bool moving = SpoolSimulator_IsMoving(&sim);
-    printf("  Moving at 20%%: %s\n", moving ? "yes" : "no");
-    
-    PRINT_TEST_PASS();
-    return TEST_PASSED;
-}
-
-/**
- * @brief Тест полного открытия (80% ШИМ)
- */
-int test_full_open_threshold(void) {
-    PRINT_TEST_START("Full Open Threshold (80%)");
-    
-    SpoolSimulator_t sim;
-    SpoolConfig_t config = {0};
-    SpoolSimulator_Init(&sim, &config);
-    
-    // PWM 80% - максимальное открытие перед упором
-    uint16_t pwm_80percent = 5600;
-    
-    for (int i = 0; i < 2000; i++) {
-        SpoolSimulator_Update(&sim, pwm_80percent, 1.0f);
+    if (!SpoolSimulator_IsInDeadZone(&sim)) {
+        TEST_FAILED(name, "Should be in dead zone");
+        return;
     }
     
-    uint16_t pos = SpoolSimulator_GetPosition(&sim);
-    printf("  Position at 80%% PWM: %u (%.2f mm)\n", 
-           pos, SpoolSimulator_GetPositionMm(&sim));
-    
-    // Позиция должна быть больше центра (движение вправо)
-    ASSERT(pos > 6000, "Position should be greater than center at 80% PWM");
-    
-    PRINT_TEST_PASS();
-    return TEST_PASSED;
-}
-
-/**
- * @brief Тест движения золотника влево
- */
-int test_move_left(void) {
-    PRINT_TEST_START("Move Left (PWM 20-50%)");
-    
-    SpoolSimulator_t sim;
-    SpoolConfig_t config = {0};
-    SpoolSimulator_Init(&sim, &config);
-    
-    uint16_t initial_pos = SpoolSimulator_GetPosition(&sim);
-    ASSERT(initial_pos == 6000, "Should start at center");
-    
-    // PWM 35% - движение влево
-    uint16_t pwm_left = 2450; // ~35%
-    
-    for (int i = 0; i < 300; i++) {
-        SpoolSimulator_Update(&sim, pwm_left, 1.0f);
-    }
-    
-    uint16_t final_pos = SpoolSimulator_GetPosition(&sim);
-    printf("  Initial: %u, Final: %u (%.2f mm)\n", 
-           initial_pos, final_pos, SpoolSimulator_GetPositionMm(&sim));
-    
-    ASSERT(final_pos < initial_pos, "Position should decrease when moving left");
-    ASSERT(final_pos > 0, "Position should not exceed left limit");
-    
-    PRINT_TEST_PASS();
-    return TEST_PASSED;
-}
-
-/**
- * @brief Тест движения золотника вправо
- */
-int test_move_right(void) {
-    PRINT_TEST_START("Move Right (PWM 50-80%)");
-    
-    SpoolSimulator_t sim;
-    SpoolConfig_t config = {0};
-    SpoolSimulator_Init(&sim, &config);
-    
-    uint16_t initial_pos = SpoolSimulator_GetPosition(&sim);
-    ASSERT(initial_pos == 6000, "Should start at center");
-    
-    // PWM 65% - движение вправо
-    uint16_t pwm_right = 4550; // ~65%
-    
-    for (int i = 0; i < 300; i++) {
-        SpoolSimulator_Update(&sim, pwm_right, 1.0f);
-    }
-    
-    uint16_t final_pos = SpoolSimulator_GetPosition(&sim);
-    printf("  Initial: %u, Final: %u (%.2f mm)\n", 
-           initial_pos, final_pos, SpoolSimulator_GetPositionMm(&sim));
-    
-    ASSERT(final_pos > initial_pos, "Position should increase when moving right");
-    ASSERT(final_pos < 12000, "Position should not exceed right limit");
-    
-    PRINT_TEST_PASS();
-    return TEST_PASSED;
-}
-
-/**
- * @brief Тест достижения пределов хода
- */
-int test_limit_detection(void) {
-    PRINT_TEST_START("Limit Detection");
-    
-    SpoolSimulator_t sim;
-    SpoolConfig_t config = {0};
-    SpoolSimulator_Init(&sim, &config);
-    
-    // Движение в правый предел (50-80% диапазон - левый клапан)
-    for (int i = 0; i < 3000; i++) {
-        SpoolSimulator_Update(&sim, 5600, 1.0f); // 80%
-    }
-    
-    uint16_t right_pos = SpoolSimulator_GetPosition(&sim);
-    printf("  Right limit position: %u (%.2f mm)\n", 
-           right_pos, SpoolSimulator_GetPositionMm(&sim));
-    
-    ASSERT(right_pos > 6000, "Should move to right from center");
-    
-    // Сброс и движение в левый предел (20-50% диапазон - правый клапан)
-    SpoolSimulator_Reset(&sim);
-    
-    // При 20% золотник только начинает страгивать, нужно больше времени
-    for (int i = 0; i < 5000; i++) {
-        SpoolSimulator_Update(&sim, 1400, 1.0f); // 20%
-    }
-    
-    uint16_t left_pos = SpoolSimulator_GetPosition(&sim);
-    printf("  Left limit position: %u (%.2f mm)\n", 
-           left_pos, SpoolSimulator_GetPositionMm(&sim));
-    
-    // Проверяем что позиция изменилась от центра или осталась близка к центру
-    // (при минимальном PWM движение может быть очень медленным)
-    ASSERT(left_pos <= 6000, "Should stay at or move left from center");
-    
-    PRINT_TEST_PASS();
-    return TEST_PASSED;
-}
-
-/**
- * @brief Тест инерции системы (задержка реакции)
- */
-int test_system_inertia(void) {
-    PRINT_TEST_START("System Inertia");
-    
-    SpoolSimulator_t sim;
-    SpoolConfig_t config = {0};
-    SpoolSimulator_Init(&sim, &config);
-    
-    uint16_t pwm_step = 4550; // 65% - движение вправо
-    
-    // Сразу после подачи сигнала золотник еще не должен значительно двигаться
-    SpoolSimulator_Update(&sim, pwm_step, 1.0f);
-    uint16_t pos_1ms = SpoolSimulator_GetPosition(&sim);
-    
-    // Через 100 мс должно быть заметное движение
-    for (int i = 0; i < 99; i++) {
-        SpoolSimulator_Update(&sim, pwm_step, 1.0f);
-    }
-    uint16_t pos_100ms = SpoolSimulator_GetPosition(&sim);
-    
-    printf("  Position at 1ms: %u\n", pos_1ms);
-    printf("  Position at 100ms: %u\n", pos_100ms);
-    
-    // Проверяем что есть задержка (позиция меняется постепенно)
-    ASSERT(pos_100ms > pos_1ms, "Position should change over time due to inertia");
-    
-    PRINT_TEST_PASS();
-    return TEST_PASSED;
-}
-
-/**
- * @brief Тест возврата в центр при снятии ШИМ
- */
-int test_return_to_center(void) {
-    PRINT_TEST_START("Return to Center");
-    
-    SpoolSimulator_t sim;
-    SpoolConfig_t config = {0};
-    SpoolSimulator_Init(&sim, &config);
-    
-    // Сначала двигаем вправо (50-80% диапазон - левый клапан)
-    for (int i = 0; i < 1000; i++) {
-        SpoolSimulator_Update(&sim, 4550, 1.0f); // 65%
-    }
-    
-    uint16_t displaced_pos = SpoolSimulator_GetPosition(&sim);
-    printf("  Displaced position: %u (%.2f mm)\n", 
-           displaced_pos, SpoolSimulator_GetPositionMm(&sim));
-    
-    ASSERT(displaced_pos > 6000, "Should be displaced from center to right");
-    
-    // Снимаем ШИМ - пружины должны вернуть золотник к центру
-    for (int i = 0; i < 1000; i++) {
-        SpoolSimulator_Update(&sim, 0, 1.0f);
-    }
-    
-    uint16_t returned_pos = SpoolSimulator_GetPosition(&sim);
-    printf("  Returned position: %u (%.2f mm)\n", 
-           returned_pos, SpoolSimulator_GetPositionMm(&sim));
-    
-    // Пружины должны вернуть близкое к центру положение
-    ASSERT(returned_pos > 5000 && returned_pos < 7000, 
-           "Should return near center when PWM removed");
-    
-    PRINT_TEST_PASS();
-    return TEST_PASSED;
-}
-
-/**
- * @brief Тест вспомогательных функций преобразования
- */
-int test_conversion_functions(void) {
-    PRINT_TEST_START("Conversion Functions");
-    
-    // PWM to Valve Open
-    ASSERT_FLOAT(0.0f, SpoolSimulator_PWMToValveOpen(0), 0.01f, "0 PWM should give 0 open");
-    ASSERT_FLOAT(0.0f, SpoolSimulator_PWMToValveOpen(1400), 0.01f, "20% PWM should give 0 open");
-    ASSERT_FLOAT(0.5f, SpoolSimulator_PWMToValveOpen(3500), 0.05f, "50% PWM should give 0.5 open");
-    ASSERT_FLOAT(1.0f, SpoolSimulator_PWMToValveOpen(5600), 0.01f, "80% PWM should give 1.0 open");
-    ASSERT_FLOAT(1.0f, SpoolSimulator_PWMToValveOpen(7000), 0.01f, "100% PWM should give 1.0 open");
-    
-    // Position to Mm
-    ASSERT_FLOAT(0.0f, SpoolSimulator_PositionToMm(0), 0.01f, "0 pos should be 0mm");
-    ASSERT_FLOAT(4.0f, SpoolSimulator_PositionToMm(6000), 0.01f, "6000 pos should be 4mm");
-    ASSERT_FLOAT(8.0f, SpoolSimulator_PositionToMm(12000), 0.01f, "12000 pos should be 8mm");
-    
-    // Mm to Position
-    ASSERT(0 == SpoolSimulator_MmToPosition(0.0f), "0mm should be 0 pos");
-    ASSERT(6000 == SpoolSimulator_MmToPosition(4.0f), "4mm should be 6000 pos");
-    ASSERT(12000 == SpoolSimulator_MmToPosition(8.0f), "8mm should be 12000 pos");
-    
-    PRINT_TEST_PASS();
-    return TEST_PASSED;
-}
-
-/**
- * @brief Тест давления в камерах
- */
-int test_chamber_pressure(void) {
-    PRINT_TEST_START("Chamber Pressure");
-    
-    SpoolSimulator_t sim;
-    SpoolConfig_t config = {0};
-    SpoolSimulator_Init(&sim, &config);
-    
-    // Начальное давление должно быть около 0
-    float p_left_initial = SpoolSimulator_GetPressureLeft(&sim);
-    float p_right_initial = SpoolSimulator_GetPressureRight(&sim);
-    
-    printf("  Initial pressures: L=%.2f Pa, R=%.2f Pa\n", p_left_initial, p_right_initial);
-    
-    // Подаем ШИМ для движения влево (20-50% диапазон - правый клапан)
-    for (int i = 0; i < 200; i++) {
-        SpoolSimulator_Update(&sim, 2450, 1.0f); // 35%
-    }
-    
-    float p_left = SpoolSimulator_GetPressureLeft(&sim);
-    float p_right = SpoolSimulator_GetPressureRight(&sim);
-    
-    printf("  After left command: L=%.2f Pa, R=%.2f Pa\n", p_left, p_right);
-    
-    // При движении влево правый клапан открывает давление справа
-    ASSERT(p_right > p_left, "Right pressure should be higher when moving left");
-    
-    PRINT_TEST_PASS();
-    return TEST_PASSED;
-}
-
-/**
- * @brief Тест стабильности при длительной работе
- */
-int test_long_term_stability(void) {
-    PRINT_TEST_START("Long Term Stability");
-    
-    SpoolSimulator_t sim;
-    SpoolConfig_t config = {0};
-    SpoolSimulator_Init(&sim, &config);
-    
-    uint16_t positions[100];
-    
-    // Циклическое изменение ШИМ
-    for (int cycle = 0; cycle < 10; cycle++) {
-        for (int pwm = 1400; pwm <= 5600; pwm += 420) {
-            for (int i = 0; i < 50; i++) {
-                SpoolSimulator_Update(&sim, pwm, 1.0f);
-            }
-        }
-        for (int pwm = 5600; pwm >= 1400; pwm -= 420) {
-            for (int i = 0; i < 50; i++) {
-                SpoolSimulator_Update(&sim, pwm, 1.0f);
-            }
-        }
-    }
-    
-    uint16_t final_pos = SpoolSimulator_GetPosition(&sim);
-    printf("  Final position after cycles: %u (%.2f mm)\n", 
-           final_pos, SpoolSimulator_GetPositionMm(&sim));
-    
-    // Позиция должна быть в допустимых пределах
-    ASSERT(final_pos >= 0 && final_pos <= 12000, 
-           "Position should stay within bounds after long operation");
-    
-    // Не должно быть NaN или бесконечностей
-    ASSERT(!isnan(SpoolSimulator_GetVelocity(&sim)), "Velocity should not be NaN");
-    ASSERT(!isinf(SpoolSimulator_GetVelocity(&sim)), "Velocity should not be Inf");
-    
-    PRINT_TEST_PASS();
-    return TEST_PASSED;
-}
-
-/**
- * @brief Тест граничных значений ШИМ
- */
-int test_pwm_boundary_values(void) {
-    PRINT_TEST_START("PWM Boundary Values");
-    
-    SpoolSimulator_t sim;
-    SpoolConfig_t config = {0};
-    
-    // Тест минимального значения
-    SpoolSimulator_Init(&sim, &config);
-    SpoolSimulator_Update(&sim, 0, 1.0f);
-    ASSERT(SpoolSimulator_GetPosition(&sim) == 6000, "PWM=0 should keep center");
-    
-    // Тест максимального значения
-    SpoolSimulator_Reset(&sim);
-    SpoolSimulator_Update(&sim, 7000, 1.0f);
-    // Должно работать без ошибок
-    
-    // Тест значений вне диапазона (должны ограничиваться)
-    SpoolSimulator_Reset(&sim);
-    SpoolSimulator_Update(&sim, 8000, 1.0f); // Выше максимума
-    SpoolSimulator_Update(&sim, 0xFFFF, 1.0f); // Значительно выше
-    
-    PRINT_TEST_PASS();
-    return TEST_PASSED;
+    TEST_PASSED(name);
+    tests_passed++;
 }
 
 /* ============================================================================
- * ГЛАВНАЯ ФУНКЦИЯ
+ * ТЕСТ 3: Движение в положительном направлении (Клапан 1)
  * ============================================================================ */
+void test_move_positive(void) {
+    const char* name = "Move Positive (Valve 1)";
+    SpoolSimulator_t sim;
+    SpoolSimulator_Init(&sim, NULL);
+    
+    // Подаем 50% на клапан 1 (3500 отсчетов), 0 на клапан 2
+    uint16_t pwm_v1 = 3500;
+    uint16_t pwm_v2 = 0;
+    
+    for (int i = 0; i < 500; i++) {
+        SpoolSimulator_Step(&sim, pwm_v1, pwm_v2, 0.001f);
+    }
+    
+    int32_t pos = SpoolSimulator_GetPosition(&sim);
+    
+    if (pos <= 0) {
+        TEST_FAILED(name, "Position should be positive when Valve 1 is active");
+        return;
+    }
+    
+    if (pos > SPOOL_POS_MAX) {
+        TEST_FAILED(name, "Position exceeds maximum");
+        return;
+    }
+    
+    TEST_PASSED(name);
+    tests_passed++;
+}
 
+/* ============================================================================
+ * ТЕСТ 4: Движение в отрицательном направлении (Клапан 2)
+ * ============================================================================ */
+void test_move_negative(void) {
+    const char* name = "Move Negative (Valve 2)";
+    SpoolSimulator_t sim;
+    SpoolSimulator_Init(&sim, NULL);
+    
+    // Подаем 0 на клапан 1, 50% на клапан 2 (3500 отсчетов)
+    uint16_t pwm_v1 = 0;
+    uint16_t pwm_v2 = 3500;
+    
+    for (int i = 0; i < 500; i++) {
+        SpoolSimulator_Step(&sim, pwm_v1, pwm_v2, 0.001f);
+    }
+    
+    int32_t pos = SpoolSimulator_GetPosition(&sim);
+    
+    if (pos >= 0) {
+        TEST_FAILED(name, "Position should be negative when Valve 2 is active");
+        return;
+    }
+    
+    if (pos < SPOOL_POS_MIN) {
+        TEST_FAILED(name, "Position exceeds minimum");
+        return;
+    }
+    
+    TEST_PASSED(name);
+    tests_passed++;
+}
+
+/* ============================================================================
+ * ТЕСТ 5: Достижение положительного предела
+ * ============================================================================ */
+void test_positive_limit(void) {
+    const char* name = "Positive Limit Detection";
+    SpoolSimulator_t sim;
+    SpoolSimulator_Init(&sim, NULL);
+    
+    // Подаем 100% на клапан 1
+    uint16_t pwm_v1 = PWM_MAX;
+    uint16_t pwm_v2 = 0;
+    
+    // Нужно больше времени из-за пружин и инерции (15 секунд)
+    for (int i = 0; i < 15000; i++) {
+        SpoolSimulator_Step(&sim, pwm_v1, pwm_v2, 0.001f);
+    }
+    
+    int32_t pos = SpoolSimulator_GetPosition(&sim);
+    
+    // Золотник должен достичь или приблизиться к максимуму (+12000)
+    if (pos < 11500) {
+        TEST_FAILED(name, "Position should be near maximum limit");
+        return;
+    }
+    
+    TEST_PASSED(name);
+    tests_passed++;
+}
+
+/* ============================================================================
+ * ТЕСТ 6: Достижение отрицательного предела
+ * ============================================================================ */
+void test_negative_limit(void) {
+    const char* name = "Negative Limit Detection";
+    SpoolSimulator_t sim;
+    SpoolSimulator_Init(&sim, NULL);
+    
+    // Подаем 100% на клапан 2
+    uint16_t pwm_v1 = 0;
+    uint16_t pwm_v2 = PWM_MAX;
+    
+    for (int i = 0; i < 15000; i++) {
+        SpoolSimulator_Step(&sim, pwm_v1, pwm_v2, 0.001f);
+    }
+    
+    int32_t pos = SpoolSimulator_GetPosition(&sim);
+    
+    // Золотник должен достичь или приблизиться к минимуму (-12000)
+    if (pos > -11500) {
+        TEST_FAILED(name, "Position should be near minimum limit");
+        return;
+    }
+    
+    TEST_PASSED(name);
+    tests_passed++;
+}
+
+/* ============================================================================
+ * ТЕСТ 7: Возврат пружинами в центр
+ * ============================================================================ */
+void test_return_to_center(void) {
+    const char* name = "Return to Center by Springs";
+    SpoolSimulator_t sim;
+    SpoolSimulator_Init(&sim, NULL);
+    
+    // Сначала двигаем в положительную сторону
+    for (int i = 0; i < 300; i++) {
+        SpoolSimulator_Step(&sim, 5000, 0, 0.001f);
+    }
+    
+    int32_t pos_before = SpoolSimulator_GetPosition(&sim);
+    if (pos_before <= 0) {
+        TEST_FAILED(name, "Should move positive first");
+        return;
+    }
+    
+    // Теперь убираем ШИМ (оба в 0)
+    for (int i = 0; i < 500; i++) {
+        SpoolSimulator_Step(&sim, 0, 0, 0.001f);
+    }
+    
+    int32_t pos_after = SpoolSimulator_GetPosition(&sim);
+    
+    // Пружины должны вернуть ближе к 0
+    if (abs(pos_after) >= abs(pos_before)) {
+        TEST_FAILED(name, "Springs should return spool toward center");
+        return;
+    }
+    
+    TEST_PASSED(name);
+    tests_passed++;
+}
+
+/* ============================================================================
+ * ТЕСТ 8: Инерция системы
+ * ============================================================================ */
+void test_system_inertia(void) {
+    const char* name = "System Inertia";
+    SpoolSimulator_t sim;
+    SpoolSimulator_Init(&sim, NULL);
+    
+    // Резко подаем 100% ШИМ
+    SpoolSimulator_Step(&sim, PWM_MAX, 0, 0.001f);
+    int32_t pos_1ms = SpoolSimulator_GetPosition(&sim);
+    
+    SpoolSimulator_Step(&sim, PWM_MAX, 0, 0.001f);
+    int32_t pos_2ms = SpoolSimulator_GetPosition(&sim);
+    
+    // Из-за инерции положение не должно измениться мгновенно
+    // Но должно начать двигаться
+    if (pos_1ms == 0 && pos_2ms == 0) {
+        // Допустимо - инерция клапана
+    }
+    
+    // Через 50мс должно уже двигаться
+    for (int i = 0; i < 50; i++) {
+        SpoolSimulator_Step(&sim, PWM_MAX, 0, 0.001f);
+    }
+    
+    int32_t pos_50ms = SpoolSimulator_GetPosition(&sim);
+    if (pos_50ms == 0) {
+        TEST_FAILED(name, "Should move after 50ms");
+        return;
+    }
+    
+    TEST_PASSED(name);
+    tests_passed++;
+}
+
+/* ============================================================================
+ * ТЕСТ 9: Преобразования единиц
+ * ============================================================================ */
+void test_conversions(void) {
+    const char* name = "Unit Conversions";
+    
+    // мм <-> отсчеты
+    float mm = 2.0f;
+    int32_t counts = SpoolSimulator_MmToCounts(mm);
+    float mm_back = SpoolSimulator_CountsToMm(counts);
+    
+    if (fabs(mm - mm_back) > 0.1f) {
+        TEST_FAILED(name, "mm conversion error");
+        return;
+    }
+    
+    // проценты <-> ШИМ
+    float percent = 50.0f;
+    uint16_t pwm = SpoolSimulator_PercentToPwm(percent);
+    float percent_back = SpoolSimulator_PwmToPercent(pwm);
+    
+    if (fabs(percent - percent_back) > 1.0f) {
+        TEST_FAILED(name, "PWM conversion error");
+        return;
+    }
+    
+    TEST_PASSED(name);
+    tests_passed++;
+}
+
+/* ============================================================================
+ * ТЕСТ 10: Давление в камерах
+ * ============================================================================ */
+void test_chamber_pressure(void) {
+    const char* name = "Chamber Pressure";
+    SpoolSimulator_t sim;
+    SpoolSimulator_Init(&sim, NULL);
+    
+    // Подаем только на клапан 1
+    for (int i = 0; i < 200; i++) {
+        SpoolSimulator_Step(&sim, 5000, 0, 0.001f);
+    }
+    
+    float pA = SpoolSimulator_GetPressureA(&sim);
+    float pB = SpoolSimulator_GetPressureB(&sim);
+    
+    if (pA <= pB) {
+        TEST_FAILED(name, "Pressure A should be higher than B");
+        return;
+    }
+    
+    if (pA <= 0) {
+        TEST_FAILED(name, "Pressure A should be positive");
+        return;
+    }
+    
+    TEST_PASSED(name);
+    tests_passed++;
+}
+
+/* ============================================================================
+ * ТЕСТ 11: Граничные значения ШИМ
+ * ============================================================================ */
+void test_pwm_boundaries(void) {
+    const char* name = "PWM Boundary Values";
+    SpoolSimulator_t sim;
+    SpoolSimulator_Init(&sim, NULL);
+    
+    // Тестируем 0%
+    SpoolSimulator_Step(&sim, 0, 0, 0.001f);
+    if (SpoolSimulator_GetPosition(&sim) != 0) {
+        TEST_FAILED(name, "0% PWM should keep position at 0");
+        return;
+    }
+    
+    // Тестируем 100%
+    SpoolSimulator_Step(&sim, PWM_MAX, 0, 0.001f);
+    // Должно начать движение
+    
+    TEST_PASSED(name);
+    tests_passed++;
+}
+
+/* ============================================================================
+ * ТЕСТ 12: Долгосрочная стабильность
+ * ============================================================================ */
+void test_long_term_stability(void) {
+    const char* name = "Long Term Stability";
+    SpoolSimulator_t sim;
+    SpoolSimulator_Init(&sim, NULL);
+    
+    // Циклически подаем сигналы
+    for (int cycle = 0; cycle < 10; cycle++) {
+        // Вправо
+        for (int i = 0; i < 100; i++) {
+            SpoolSimulator_Step(&sim, 4000, 0, 0.001f);
+        }
+        // Влево
+        for (int i = 0; i < 200; i++) {
+            SpoolSimulator_Step(&sim, 0, 4000, 0.001f);
+        }
+    }
+    
+    int32_t final_pos = SpoolSimulator_GetPosition(&sim);
+    
+    // Не должно быть переполнений или NaN
+    if (final_pos < SPOOL_POS_MIN || final_pos > SPOOL_POS_MAX) {
+        TEST_FAILED(name, "Position out of bounds");
+        return;
+    }
+    
+    TEST_PASSED(name);
+    tests_passed++;
+}
+
+/* ============================================================================
+ * MAIN
+ * ============================================================================ */
 int main(void) {
-    int passed = 0;
-    int failed = 0;
+    printf("=== Spool Simulator Tests (Dual Valve) ===\n\n");
     
-    printf("============================================================\n");
-    printf("       SPOOL SIMULATOR MODULE TESTS\n");
-    printf("       Testing hydraulic spool simulation for STM32F303\n");
-    printf("============================================================\n");
+    tests_run++; test_initialization();
+    tests_run++; test_dead_zone();
+    tests_run++; test_move_positive();
+    tests_run++; test_move_negative();
+    tests_run++; test_positive_limit();
+    tests_run++; test_negative_limit();
+    tests_run++; test_return_to_center();
+    tests_run++; test_system_inertia();
+    tests_run++; test_conversions();
+    tests_run++; test_chamber_pressure();
+    tests_run++; test_pwm_boundaries();
+    tests_run++; test_long_term_stability();
     
-    #define RUN_TEST(test_func) \
-        do { \
-            if (test_func() == TEST_PASSED) { \
-                passed++; \
-            } else { \
-                failed++; \
-            } \
-        } while(0)
+    printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     
-    RUN_TEST(test_initialization);
-    RUN_TEST(test_stiction_threshold);
-    RUN_TEST(test_full_open_threshold);
-    RUN_TEST(test_move_left);
-    RUN_TEST(test_move_right);
-    RUN_TEST(test_limit_detection);
-    RUN_TEST(test_system_inertia);
-    RUN_TEST(test_return_to_center);
-    RUN_TEST(test_conversion_functions);
-    RUN_TEST(test_chamber_pressure);
-    RUN_TEST(test_long_term_stability);
-    RUN_TEST(test_pwm_boundary_values);
-    
-    printf("\n============================================================\n");
-    printf("                    TEST SUMMARY\n");
-    printf("============================================================\n");
-    printf("  Total tests: %d\n", passed + failed);
-    printf("  Passed:      %d ✅\n", passed);
-    printf("  Failed:      %d ❌\n", failed);
-    printf("============================================================\n");
-    
-    return (failed == 0) ? 0 : 1;
+    return (tests_passed == tests_run) ? 0 : 1;
 }

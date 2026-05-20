@@ -1,7 +1,10 @@
 ```
-# Compiled and build artifacts
+# Compiled/Binary files
 *.o
 *.obj
 *.out
+debug_test
+debug_test2
+example_usage
 test_spool
 ```

@@ -1,145 +1,115 @@
 /**
  * @file spool_simulator.h
- * @brief Модуль симуляции воздействия ШИМ сигнала на пропорциональные клапаны
- *        и положения золотника для STM32F303
+ * @brief Симулятор гидравлического золотника с управлением двумя пропорциональными клапанами
  * 
- * Описание системы:
- * - Золотник подпружинен с обеих сторон (нагрузка до 12кг)
- * - Два пропорциональных клапана PPRV-04-S-25-D24 (24В, 25 бар)
- * - Трубки: внутренний диаметр 2мм, длина 100мм
- * - Площадь давления на золотник: 1 см²
- * - Ход золотника: 8мм
- * 
- * Интерфейс:
- * - Вход: значение ШИМ 0-7000 (0% - 100%)
- * - Выход: положение золотника 0-12000 (соответствует 0-8мм)
- * 
- * Характеристики:
- * - Страгивание начинается при 20% ШИМ (~1400 отсчетов)
- * - Полное открытие при 80% ШИМ (~5600 отсчетов)
- * - Учитывается инерция гидравлической системы и задержки
+ * Особенности:
+ * - Два независимых входа ШИМ (Клапан 1: 0..+12000, Клапан 2: 0..-12000)
+ * - Мертвая зона: при ШИМ < 10% пружины возвращают золотник в 0
+ * - Параметр нестабильности давления RND_PRESS_DEVIATION
+ * - Совместимость с STM32F303 (без динамической памяти)
  */
 
 #ifndef SPOOL_SIMULATOR_H
 #define SPOOL_SIMULATOR_H
 
+#include <stdint.h>
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include <stdint.h>
-#include <stdbool.h>
+/* ================= Конфигурация ================= */
 
-/* ============================================================================
- * КОНСТАНТЫ И ПАРАМЕТРЫ СИСТЕМЫ
- * ============================================================================ */
+// Диапазоны сигналов
+#define PWM_MIN             0U
+#define PWM_MAX             7000U
+#define PWM_NEUTRAL_THRESHOLD_PERCENT 10U // Мертвая зона (<10% - возврат в центр)
+#define PWM_NEUTRAL_THRESHOLD ((PWM_MAX * PWM_NEUTRAL_THRESHOLD_PERCENT) / 100U) // 700 отсчетов
 
-// Параметры ШИМ
-#define PWM_MIN_VALUE           0U
-#define PWM_MAX_VALUE           7000U
-#define PWM_THRESHOLD_START     1400U   // 20% от 7000 - начало страгивания
-#define PWM_THRESHOLD_FULL      5600U   // 80% от 7000 - полное открытие
+// Диапазон положения золотника
+#define SPOOL_POS_MIN       (-12000)
+#define SPOOL_POS_MAX       (12000)
+#define SPOOL_POS_CENTER    0
+#define SPOOL_STROKE_MM     8.0f          // Полный ход 8мм (-4..+4мм от центра)
+#define SPOOL_POS_SCALE     (SPOOL_STROKE_MM / (float)SPOOL_POS_MAX) // мм на отсчет
 
-// Параметры положения золотника
-#define SPOOL_POS_MIN           0U
-#define SPOOL_POS_MAX           12000U
-#define SPOOL_STROKE_MM         8.0f    // Полный ход в мм
-#define SPOOL_POS_PER_MM        1500.0f // 12000 / 8 = 1500 отсчетов на мм
+// Физические параметры
+#define SYSTEM_PRESSURE_BAR 25.0f         // Рабочее давление 25 бар
+#define SYSTEM_PRESSURE_PA  (SYSTEM_PRESSURE_BAR * 1e5f) // Па
+#define TUBE_DIAMETER_MM    2.0f
+#define TUBE_LENGTH_MM      100.0f
+#define SPOOL_AREA_CM2      1.0f
+#define SPOOL_AREA_M2       (SPOOL_AREA_CM2 * 1e-4f)
+#define SPRING_FORCE_KG     12.0f         // Нагрузка пружин 12кг
+#define SPRING_FORCE_N      (SPRING_FORCE_KG * 9.81f)
+#define OIL_BULK_MODULUS    1.4e9f        // Модуль объемной упругости масла (Па)
+#define OIL_DENSITY         850.0f        // Плотность масла (кг/м³)
+#define VISCOSITY_DAMPING   500.0f        // Коэффициент демпфирования
 
-// Физические параметры системы
-#define SYSTEM_PRESSURE_BAR     25.0f   // Рабочее давление 25 бар
-#define SYSTEM_PRESSURE_PA      (SYSTEM_PRESSURE_BAR * 100000.0f) // 2.5 МПа
-#define PISTON_AREA_M2          0.0001f // 1 см² = 0.0001 м²
-#define SPRING_FORCE_MAX_N      117.6f  // 12кг * 9.8 м/с²
-#define SPRING_STIFFNESS_N_M    5000.0f // Жесткость пружины Н/м
-
-// Параметры трубок
-#define TUBE_DIAMETER_M         0.002f  // 2мм
-#define TUBE_LENGTH_M           0.1f    // 100мм
-#define TUBE_AREA_M2            (3.14159f * TUBE_DIAMETER_M * TUBE_DIAMETER_M / 4.0f)
-#define TUBE_VOLUME_M3          (TUBE_AREA_M2 * TUBE_LENGTH_M)
-
-// Параметры гидравлической жидкости (трансформаторное масло)
-#define OIL_BULK_MODULUS_PA     1.4e9f  // Модуль объемной упругости ~1400 МПа
-#define OIL_DENSITY_KG_M3       850.0f  // Плотность масла кг/м³
-#define OIL_VISCOSITY_PAS       0.032f  // Динамическая вязкость ~32 сСт
-
-// Параметры динамики системы
-#define VALVE_RESPONSE_TIME_MS  15.0f   // Время реакции клапана мс
-#define HYDRAULIC_DELAY_MS      5.0f    // Гидравлическая задержка мс
-#define SYSTEM_DAMPING          0.7f    // Коэффициент демпфирования
+// Нестабильность давления (%)
+#ifndef RND_PRESS_DEVIATION
+#define RND_PRESS_DEVIATION 2.0f          // По умолчанию ±2%
+#endif
 
 // Параметры симуляции
-#define SIMULATION_DT_MS        1.0f    // Шаг симуляции мс
-#define SIMULATION_FREQ_HZ      1000U   // Частота обновления симуляции
+#define VALVE_RESPONSE_TIME_MS 15.0f      // Время реакции клапана (мс)
+#define SPOOL_MASS_KG       0.3f          // Масса золотника (примерно)
 
-/* ============================================================================
- * ТИПЫ ДАННЫХ
- * ============================================================================ */
+// Сила пружины на полном ходе (для расчета жесткости)
+// Пружина должна возвращать золотник в центр, но не мешать полному ходу при макс давлении
+// При 25 бар и площади 1см² сила = 250Н, пружина должна быть слабее
+#define SPRING_STIFFNESS_N_PER_MM  (SPRING_FORCE_N / 4.0f) // Н/мм (на полный ход 4мм)
+
+/* ================= Типы данных ================= */
+
+/**
+ * @brief Структура конфигурации симулятора
+ */
+typedef struct {
+    float dt;                 // Шаг симуляции (сек)
+    float pressure_deviation; // Разброс давления (%)
+    uint32_t seed;            // Начальное значение для ГСЧ
+} SpoolConfig_t;
 
 /**
  * @brief Структура состояния симулятора
  */
 typedef struct {
-    // Входные данные
-    uint16_t pwm_value;             // Текущее значение ШИМ (0-7000)
+    // Входы
+    uint16_t pwm_valve1;      // ШИМ клапана 1 (движение в +)
+    uint16_t pwm_valve2;      // ШИМ клапана 2 (движение в -)
     
-    // Состояние клапанов
-    float valve_open_left;          // Открытие левого клапана (0.0-1.0)
-    float valve_open_right;         // Открытие правого клапана (0.0-1.0)
-    float valve_target_left;        // Целевое открытие левого клапана
-    float valve_target_right;       // Целевое открытие правого клапана
+    // Состояния клапанов (фильтрованные)
+    float valve1_opening;     // 0.0 .. 1.0
+    float valve2_opening;     // 0.0 .. 1.0
     
-    // Давления в камерах
-    float pressure_left;            // Давление в левой камере (Па)
-    float pressure_right;           // Давление в правой камере (Па)
+    // Давления в камерах (Па)
+    float pressure_A;         // Камера A (клапан 1)
+    float pressure_B;         // Камера B (клапан 2)
     
     // Состояние золотника
-    float spool_position;           // Положение золотника (0.0-12000.0)
-    float spool_velocity;           // Скорость золотника (отсчетов/с)
-    float spool_acceleration;       // Ускорение золотника (отсчетов/с²)
+    float position_mm;        // Положение в мм (-4.0 .. +4.0)
+    float velocity;           // Скорость (м/с)
+    int32_t position_counts;  // Положение в отсчетах (-12000 .. +12000)
     
-    // Силы
-    float force_left;               // Сила слева (Н)
-    float force_right;              // Сила справа (Н)
-    float force_spring;             // Сила пружины (Н)
-    float force_damping;            // Сила демпфирования (Н)
-    float force_net;                // Результирующая сила (Н)
+    // Внутренние переменные
+    float sim_time;
+    uint32_t rng_state;
     
-    // Временные параметры
-    uint32_t last_update_time;      // Время последнего обновления (мс)
-    float simulation_time;          // Время симуляции (с)
-    
-    // Флаги состояния
-    bool initialized;               // Флаг инициализации
-    bool spool_moving;              // Золотник в движении
-    bool at_limit_left;             // Достигнут левый предел
-    bool at_limit_right;            // Достигнут правый предел
-    
+    // Флаги
+    bool at_limit_positive;
+    bool at_limit_negative;
 } SpoolSimulator_t;
 
-/**
- * @brief Конфигурация симулятора
- */
-typedef struct {
-    float dt_ms;                    // Шаг симуляции в мс
-    float valve_response_time_ms;   // Время реакции клапана
-    float hydraulic_delay_ms;       // Гидравлическая задержка
-    float damping_coefficient;      // Коэффициент демпфирования
-    float mass_kg;                  // Масса золотника (кг)
-} SpoolConfig_t;
-
-/* ============================================================================
- * ФУНКЦИИ ИНИЦИАЛИЗАЦИИ
- * ============================================================================ */
+/* ================= Инициализация ================= */
 
 /**
  * @brief Инициализация симулятора
  * @param sim Указатель на структуру симулятора
- * @param config Конфигурация симулятора
- * @return true при успешной инициализации
+ * @param config Конфигурация (можно NULL для значений по умолчанию)
  */
-bool SpoolSimulator_Init(SpoolSimulator_t* sim, const SpoolConfig_t* config);
+void SpoolSimulator_Init(SpoolSimulator_t* sim, const SpoolConfig_t* config);
 
 /**
  * @brief Сброс симулятора в начальное состояние
@@ -147,91 +117,104 @@ bool SpoolSimulator_Init(SpoolSimulator_t* sim, const SpoolConfig_t* config);
  */
 void SpoolSimulator_Reset(SpoolSimulator_t* sim);
 
-/* ============================================================================
- * ОСНОВНЫЕ ФУНКЦИИ СИМУЛЯЦИИ
- * ============================================================================ */
+/* ================= Основной цикл ================= */
 
 /**
- * @brief Обновление состояния симулятора
+ * @brief Шаг симуляции
  * @param sim Указатель на структуру симулятора
- * @param pwm_value Новое значение ШИМ (0-7000)
- * @param dt_ms Время прошедшее с последнего обновления (мс)
+ * @param pwm_v1 Значение ШИМ клапана 1 (0-7000)
+ * @param pwm_v2 Значение ШИМ клапана 2 (0-7000)
+ * @param dt Шаг времени в секундах (рекомендуется 0.001 для 1мс)
  */
-void SpoolSimulator_Update(SpoolSimulator_t* sim, uint16_t pwm_value, float dt_ms);
+void SpoolSimulator_Step(SpoolSimulator_t* sim, uint16_t pwm_v1, uint16_t pwm_v2, float dt);
+
+/* ================= Получение данных ================= */
 
 /**
- * @brief Получение текущего положения золотника
+ * @brief Получить текущее положение золотника в отсчетах
  * @param sim Указатель на структуру симулятора
- * @return Положение золотника (0-12000)
+ * @return Положение от -12000 до +12000
  */
-uint16_t SpoolSimulator_GetPosition(const SpoolSimulator_t* sim);
+int32_t SpoolSimulator_GetPosition(const SpoolSimulator_t* sim);
 
 /**
- * @brief Получение положения золотника в мм
+ * @brief Получить текущее положение золотника в мм
  * @param sim Указатель на структуру симулятора
- * @return Положение золотника в мм (0.0-8.0)
+ * @return Положение от -4.0 до +4.0 мм
  */
 float SpoolSimulator_GetPositionMm(const SpoolSimulator_t* sim);
 
 /**
- * @brief Получение скорости золотника
+ * @brief Получить давление в камере A (клапан 1)
  * @param sim Указатель на структуру симулятора
- * @return Скорость золотника (отсчетов/с)
+ * @return Давление в Паскалях
+ */
+float SpoolSimulator_GetPressureA(const SpoolSimulator_t* sim);
+
+/**
+ * @brief Получить давление в камере B (клапан 2)
+ * @param sim Указатель на структуру симулятора
+ * @return Давление в Паскалях
+ */
+float SpoolSimulator_GetPressureB(const SpoolSimulator_t* sim);
+
+/**
+ * @brief Получить скорость золотника
+ * @param sim Указатель на структуру симулятора
+ * @return Скорость в м/с
  */
 float SpoolSimulator_GetVelocity(const SpoolSimulator_t* sim);
 
-/* ============================================================================
- * ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
- * ============================================================================ */
-
 /**
- * @brief Преобразование значения ШИМ в процент открытия клапана
- * @param pwm_value Значение ШИМ (0-7000)
- * @return Процент открытия (0.0-1.0)
+ * @brief Проверка достижения положительного предела
+ * @param sim Указатель на структуру симулятора
+ * @return true если достигнут предел +12000
  */
-float SpoolSimulator_PWMToValveOpen(uint16_t pwm_value);
+bool SpoolSimulator_IsAtPositiveLimit(const SpoolSimulator_t* sim);
 
 /**
- * @brief Преобразование положения в мм
- * @param position Положение в отсчетах (0-12000)
- * @return Положение в мм
+ * @brief Проверка достижения отрицательного предела
+ * @param sim Указатель на структуру симулятора
+ * @return true если достигнут предел -12000
  */
-float SpoolSimulator_PositionToMm(uint16_t position);
+bool SpoolSimulator_IsAtNegativeLimit(const SpoolSimulator_t* sim);
 
 /**
- * @brief Преобразование мм в положение
- * @param mm Положение в мм
+ * @brief Проверка нахождения в мертвой зоне
+ * @param sim Указатель на структуру симулятора
+ * @return true если оба ШИМ < 10%
+ */
+bool SpoolSimulator_IsInDeadZone(const SpoolSimulator_t* sim);
+
+/* ================= Утилиты ================= */
+
+/**
+ * @brief Преобразование положения в мм в отсчеты
+ * @param pos_mm Положение в мм
  * @return Положение в отсчетах
  */
-uint16_t SpoolSimulator_MmToPosition(float mm);
+int32_t SpoolSimulator_MmToCounts(float pos_mm);
 
 /**
- * @brief Проверка инициализирован ли симулятор
- * @param sim Указатель на структуру симулятора
- * @return true если симулятор инициализирован
+ * @brief Преобразование отсчетов в мм
+ * @param counts Положение в отсчетах
+ * @return Положение в мм
  */
-bool SpoolSimulator_IsInitialized(const SpoolSimulator_t* sim);
+float SpoolSimulator_CountsToMm(int32_t counts);
 
 /**
- * @brief Получение флага движения золотника
- * @param sim Указатель на структуру симулятора
- * @return true если золотник движется
+ * @brief Преобразование процентов ШИМ в отсчеты
+ * @param percent Процент (0-100)
+ * @return Отсчеты ШИМ (0-7000)
  */
-bool SpoolSimulator_IsMoving(const SpoolSimulator_t* sim);
+uint16_t SpoolSimulator_PercentToPwm(float percent);
 
 /**
- * @brief Получение давления в левой камере
- * @param sim Указатель на структуру симулятора
- * @return Давление в Па
+ * @brief Преобразование отсчетов ШИМ в проценты
+ * @param pwm Отсчеты ШИМ (0-7000)
+ * @return Процент (0-100)
  */
-float SpoolSimulator_GetPressureLeft(const SpoolSimulator_t* sim);
-
-/**
- * @brief Получение давления в правой камере
- * @param sim Указатель на структуру симулятора
- * @return Давление в Па
- */
-float SpoolSimulator_GetPressureRight(const SpoolSimulator_t* sim);
+float SpoolSimulator_PwmToPercent(uint16_t pwm);
 
 #ifdef __cplusplus
 }
